@@ -12,7 +12,7 @@
     <stringAttribute key="distributedTLC" value="off"/>
     <stringAttribute key="distributedTLCVMArgs" value=""/>
     <intAttribute key="fpBits" value="1"/>
-    <intAttribute key="fpIndex" value="41"/>
+    <intAttribute key="fpIndex" value="20"/>
     <booleanAttribute key="fpIndexRandom" value="true"/>
     <intAttribute key="maxHeapSize" value="40"/>
     <intAttribute key="maxSetSize" value="1000000"/>
@@ -55,6 +55,9 @@
     <intAttribute key="simuSeed" value="-1"/>
     <stringAttribute key="specName" value="DistributedTransaction"/>
     <stringAttribute key="tlcResourcesProfile" value="local nomal"/>
+    <listAttribute key="traceExploreExpressions">
+        <listEntry value="1{write \in key_write[k2]: write.ts &lt;= 3 /\ write.type = &quot;write&quot;}"/>
+    </listAttribute>
     <stringAttribute key="view" value=""/>
     <booleanAttribute key="visualizeStateGraph" value="false"/>
 </launchConfiguration>

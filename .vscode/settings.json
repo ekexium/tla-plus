@@ -1,0 +1,8 @@
+{
+    "[tlaplus]": {
+        "editor.insertSpaces": true,
+        "editor.tabSize": 2,
+        "editor.formatOnType": true,
+        "editor.detectIndentation": false
+    }
+}

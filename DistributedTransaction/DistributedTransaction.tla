@@ -1,5 +1,5 @@
 ----------------------- MODULE DistributedTransaction -----------------------
-EXTENDS Integers
+EXTENDS Integers, TLC
 
 \* The set of all keys.
 CONSTANTS KEY
@@ -105,7 +105,7 @@ ReqMessages ==
   \union  [start_ts : Ts, primary : KEY, type : {"resolve_committed"}, commit_ts : Ts]
 
 RespMessages ==
-          [start_ts : Ts, type : {"prewrited", "locked_key"}, key : KEY]
+          [start_ts : Ts, type : {"prewritten", "locked_key"}, key : KEY]
   \union  [start_ts : Ts, type : {"lock_failed"}, key : KEY, latest_commit_ts : Ts]
   \union  [start_ts : Ts, type : {"committed",
                                   "commit_aborted",
@@ -196,11 +196,11 @@ ClientPrewriteOptimisistic(c) ==
                 key |-> k] : k \in CLIENT_KEY[c]})
   /\ UNCHANGED <<resp_msgs, key_vars>>
 
-ClientPrewrited(c) ==
+ClientPrewritten(c) ==
   /\ client_state[c] = "prewriting"
   /\ client_key[c].locking = {}
   /\ \E resp \in resp_msgs :
-      /\ resp.type = "prewrited"
+      /\ resp.type = "prewritten"
       /\ resp.start_ts = client_ts[c].start_ts
       /\ resp.key \in client_key[c].prewriting
       /\ client_key' = [client_key EXCEPT ![c].prewriting = @ \ {resp.key}]
@@ -323,7 +323,7 @@ ServerPrewritePessimistic ==
                                                       primary |-> req.primary,
                                                       type |-> "prewrite_pessimistic"]}]
               /\ key_data' = [key_data EXCEPT ![k] = @ \union {start_ts}]
-              /\ SendResp([start_ts |-> start_ts, type |-> "prewrited", key |-> k])
+              /\ SendResp([start_ts |-> start_ts, type |-> "prewritten", key |-> k])
               /\ UNCHANGED <<req_msgs, client_vars, key_write, next_ts>>
            ELSE
               /\ SendResp([start_ts |-> start_ts, type |-> "prewrite_aborted"])
@@ -349,7 +349,7 @@ ServerPrewriteOptimistic ==
                                                        primary |-> req.primary,
                                                        type |-> "prewrite_optimistic"]}]
               /\ key_data' = [key_data EXCEPT ![k] = @ \union {start_ts}]
-              /\ SendResp([start_ts |-> start_ts, type |-> "prewrited", key |-> k])
+              /\ SendResp([start_ts |-> start_ts, type |-> "prewritten", key |-> k])
               /\ UNCHANGED <<req_msgs, client_vars, key_write, next_ts>>
 
 ServerCommit ==
@@ -458,14 +458,14 @@ Init ==
 Next ==
   \/ \E c \in OPTIMISTIC_CLIENT :
         \/ ClientPrewriteOptimisistic(c)
-        \/ ClientPrewrited(c)
+        \/ ClientPrewritten(c)
         \/ ClientCommit(c)
   \/ \E c \in PESSIMISTIC_CLIENT :
         \/ ClientLockKey(c)
         \/ ClientLockedKey(c)
         \/ ClientRetryLockKey(c)
         \/ ClientPrewritePessimistic(c)
-        \/ ClientPrewrited(c)
+        \/ ClientPrewritten(c)
         \/ ClientCommit(c)
   \/ ServerLockKey
   \/ ServerPrewritePessimistic
@@ -509,7 +509,7 @@ CommitConsistency ==
             (~ \E l \in key_lock[k] : l.ts = resp.start_ts) =
               keyCommitted(k, resp.start_ts)
 
-\* If a transaction is aborted, all key of that transaction must be not
+\* If a transaction is aborted, all keys of that transaction must not be
 \* committed.
 AbortConsistency ==
   \A resp \in resp_msgs :
@@ -562,6 +562,21 @@ MsgTsConsistency ==
           req.commit_ts <= next_ts
   /\ \A resp \in resp_msgs : resp.start_ts <= next_ts
 
+\* a client always read the same snapshot of other keys
+SnapshotRead == 
+  [][
+    \A c \in CLIENT:
+      \A key \in KEY \ CLIENT_KEY[c]:
+        LET
+          snapshot_ts == client_ts[c].start_ts
+          snapshot == {write \in key_write[key]: write.ts <= snapshot_ts /\ write.type = "write"}
+          new_snapshot == {write \in key_write'[key]: write.ts <= snapshot_ts /\ write.type = "write"}
+        IN
+          snapshot = new_snapshot
+    ]_vars
+    
+
+
 \* SnapshotIsolation is implied from the following assumptions (but is not
 \* nessesary), because SnapshotIsolation means that: 
 \*  (1) Once a transcation is committed, all keys of the transaction should
@@ -580,6 +595,7 @@ SnapshotIsolation == /\ CommitConsistency
                      /\ NextTsMonotonicity
                      /\ MsgMonotonicity
                      /\ MsgTsConsistency
+                     /\ SnapshotRead
 -----------------------------------------------------------------------------
 THEOREM Safety ==
   Spec => [](/\ TypeOK
