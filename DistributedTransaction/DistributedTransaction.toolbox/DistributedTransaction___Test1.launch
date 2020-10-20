@@ -55,9 +55,7 @@
     <intAttribute key="simuSeed" value="-1"/>
     <stringAttribute key="specName" value="DistributedTransaction"/>
     <stringAttribute key="tlcResourcesProfile" value="local nomal"/>
-    <listAttribute key="traceExploreExpressions">
-        <listEntry value="1{write \in key_write[k2]: write.ts &lt;= 3 /\ write.type = &quot;write&quot;}"/>
-    </listAttribute>
+    <listAttribute key="traceExploreExpressions"/>
     <stringAttribute key="view" value=""/>
     <booleanAttribute key="visualizeStateGraph" value="false"/>
 </launchConfiguration>

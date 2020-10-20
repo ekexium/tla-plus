@@ -1,6 +1,17 @@
 ----------------------- MODULE DistributedTransaction -----------------------
 EXTENDS Integers, TLC
 
+(*
+  This module specifies the behavior of the transaction layer in TiKV.
+  Features: optimistic & pessimistic transaction, async commit. 
+  Async commit is enabled in all clients.
+  
+  We abstract over partitioning and replication, the server in the spec
+  can be viewd as the leader of a region.
+
+  All actions are treated atomically.
+*)
+
 \* The set of all keys.
 CONSTANTS KEY
 
@@ -84,6 +95,14 @@ VARIABLES client_key
 \* maintained by PD, the time oracle of a cluster.
 VARIABLES next_ts
 
+\* The max timestamp of the txns that the server has seen.
+\* It is updated by every:
+\*    start_ts for read, 
+\*    for_update_ts for pessimistic lock acquisition, if it reads some value
+\*    start_ts when rollback
+\* It is used to calculate the commit timestamp.
+VARIABLES max_ts
+
 msg_vars == <<req_msgs, resp_msgs>>
 client_vars == <<client_state, client_ts, client_key>>
 key_vars == <<key_data, key_lock, key_write>>
@@ -97,11 +116,11 @@ SendResp(msg) == resp_msgs' = resp_msgs \union {msg}
 ReqMessages ==
           [start_ts : Ts, primary : KEY, type : {"lock_key"}, key : KEY,
             for_update_ts : Ts]
-  \union  [start_ts : Ts, primary : KEY, type : {"prewrite_optimistic"}, key : KEY]
-  \union  [start_ts : Ts, primary : KEY, type : {"prewrite_pessimistic"}, key : KEY]
+  \union  [start_ts : Ts, primary : KEY, type : {"prewrite_optimistic"}, keys : SUBSET KEY]
+  \union  [start_ts : Ts, primary : KEY, type : {"prewrite_pessimistic"}, keys : SUBSET KEY]
   \union  [start_ts : Ts, primary : KEY, type : {"commit"}, commit_ts : Ts]
   \union  [start_ts : Ts, primary : KEY, type : {"cleanup"}]
-  \union  [start_ts : Ts, primary : KEY, type : {"resolve_rollbacked"}]
+  \union  [start_ts : Ts, primary : KEY, type : {"resolve_rolledback"}]
   \union  [start_ts : Ts, primary : KEY, type : {"resolve_committed"}, commit_ts : Ts]
 
 RespMessages ==
@@ -119,7 +138,11 @@ TypeOK == /\ req_msgs \in SUBSET ReqMessages
                                           primary : KEY, 
                                           type : {"prewrite_optimistic",
                                                   "prewrite_pessimistic",
-                                                  "lock_key"}]]
+                                                  "lock_key"},
+                                          \* only used for lock of primary key. For secondary keys, can just be {}
+                                          secondaries: SUBSET KEY 
+                                         ]
+                          ]
           /\ \A k \in KEY :
               \* At most one lock in key_lock[k]
               \A l, l2 \in key_lock[k] :
@@ -127,12 +150,12 @@ TypeOK == /\ req_msgs \in SUBSET ReqMessages
           /\ key_write \in [KEY -> SUBSET (
                       [ts : Ts, start_ts : Ts, type : {"write"}]
               \union  [ts : Ts, start_ts : Ts, type : {"rollback"}, protected : BOOLEAN])]
-          /\ client_state \in [CLIENT -> {"init", "locking", "prewriting", "committing"}]
+          /\ client_state \in [CLIENT -> {"init", "locking", "prewriting", "committing", "committed", "aborted"}]
           /\ client_ts \in [CLIENT -> [start_ts : Ts \union {NoneTs},
-                                       commit_ts : Ts \union {NoneTs},
                                        for_update_ts : Ts \union {NoneTs}]]
           /\ client_key \in [CLIENT -> [locking: SUBSET KEY, prewriting : SUBSET KEY]]
           /\ next_ts \in Ts
+          /\ max_ts \in Nat
 -----------------------------------------------------------------------------
 \* Client Actions
 
@@ -148,7 +171,7 @@ ClientLockKey(c) ==
                 primary |-> CLIENT_PRIMARY[c],
                 key |-> k,
                 for_update_ts |-> client_ts'[c].for_update_ts] : k \in CLIENT_KEY[c]})
-  /\ UNCHANGED <<resp_msgs, key_vars>>
+  /\ UNCHANGED <<resp_msgs, key_vars, max_ts>>
 
 ClientLockedKey(c) ==
   /\ client_state[c] = "locking"
@@ -193,8 +216,9 @@ ClientPrewriteOptimisistic(c) ==
   /\ SendReqs({[type |-> "prewrite_optimistic",
                 start_ts |-> client_ts'[c].start_ts,
                 primary |-> CLIENT_PRIMARY[c],
-                key |-> k] : k \in CLIENT_KEY[c]})
-  /\ UNCHANGED <<resp_msgs, key_vars>>
+                keys |-> {k: k \in CLIENT_KEY[c]}
+                ]})
+  /\ UNCHANGED <<resp_msgs, key_vars, max_ts>>
 
 ClientPrewritten(c) ==
   /\ client_state[c] = "prewriting"
@@ -209,16 +233,30 @@ ClientPrewritten(c) ==
 ClientCommit(c) ==
   /\ client_state[c] = "prewriting"
   /\ client_key[c].prewriting = {}
-  /\ client_state' = [client_state EXCEPT ![c] = "committing"]
-  /\ client_ts' = [client_ts EXCEPT ![c].commit_ts = next_ts]
+  /\ client_state' = [client_state EXCEPT ![c] = "committed"]
   /\ next_ts' = next_ts + 1
-  /\ SendReqs({[type |-> "commit",
-               start_ts |-> client_ts'[c].start_ts,
-               primary |-> CLIENT_PRIMARY[c],
-               commit_ts |-> client_ts'[c].commit_ts]})
-  /\ UNCHANGED <<resp_msgs, key_vars, client_key>>
+  /\ UNCHANGED <<req_msgs, key_vars, client_ts, client_key>>
+
+ClientCommitted(c) == 
+  \E resp \in resp_msgs :
+    /\ resp.start_ts = client_ts[c].start_ts
+    /\ resp.type = "committed"
+    /\ client_state' = [client_state EXCEPT ![c] = "committed"]
+
+ClientAborted(c) ==
+  \E resp \in resp_msgs :
+    /\ resp.start_ts = client_ts[c].start_ts
+    /\ resp.type \in {"commit_aborted", "prewrite_aborted", "lock_key_aborted"}
+    /\ client_state' = [client_state EXCEPT ![c] = "aborted"]
 -----------------------------------------------------------------------------
 \* Server Actions
+
+update_max_ts(ts) == 
+  IF ts > max_ts
+  THEN
+    max_ts' = ts
+  ELSE
+    UNCHANGED max_ts
 
 \* Write the write column and unlock the lock iff the lock exists.
 commit(pk, start_ts, commit_ts) ==
@@ -282,7 +320,7 @@ ServerLockKey ==
               IF \E w \in key_write[k] : w.start_ts = start_ts /\ w.type = "rollback"
               THEN
                 \* If corresponding rollback record is found, which
-                \* indicates that the transcation is rollbacked, abort the
+                \* indicates that the transcation is rolled back, abort the
                 \* transaction.
                 /\ SendResp([start_ts |-> start_ts, type |-> "lock_key_aborted"])
                 /\ UNCHANGED <<req_msgs, client_vars, key_vars, next_ts>>
@@ -296,6 +334,7 @@ ServerLockKey ==
                    /\ key_lock' = [key_lock EXCEPT ![k] = {[ts |-> start_ts,
                                                             primary |-> req.primary,
                                                             type |-> "lock_key"]}]
+                   /\ update_max_ts(req.for_update_ts)
                    /\ SendResp([start_ts |-> start_ts, type |-> "locked_key", key |-> k])
                    /\ UNCHANGED <<req_msgs, client_vars, key_data, key_write, next_ts>>
                 \* Otherwise, reject the request and let client to retry
@@ -379,7 +418,7 @@ ServerCommit ==
 \* In the spec, the primary key with a lock may clean up itself
 \* spontaneously.  There is no need to model a client to request clean up
 \* because there is no difference between a optimistic client trying to
-\* read a key that has lock timeouted and the key trying to unlock itself.
+\* read a key that has lock timed out and the key trying to unlock itself.
 ServerCleanupStaleLock ==
   \E k \in KEY :
     \E l \in key_lock[k] :
@@ -388,7 +427,7 @@ ServerCleanupStaleLock ==
                     primary |-> l.primary]})
       /\ UNCHANGED <<resp_msgs, client_vars, key_vars, next_ts>>
 
-\* Clean up stale locks by checking the status of the primary key.  Commmit
+\* Clean up stale locks by checking the status of the primary key. Commit
 \* the secondary keys if primary key is committed; otherwise rollback the
 \* transaction by rolling-back the primary key, and then also rollback the
 \* secondarys.
@@ -398,7 +437,8 @@ ServerCleanup ==
     /\ LET
           pk == req.primary
           start_ts == req.start_ts
-          committed == {w \in key_write[pk] : w.start_ts = start_ts /\ w.type = "write"}
+          committed == 
+            \/ {w \in key_write[pk] : w.start_ts = start_ts /\ w.type = "write"}
        IN
           IF committed /= {}
           THEN
@@ -409,7 +449,7 @@ ServerCleanup ==
             /\ UNCHANGED <<resp_msgs, client_vars, key_vars, next_ts>>
           ELSE
             /\ rollback(pk, start_ts)
-            /\ SendReqs({[type |-> "resolve_rollbacked",
+            /\ SendReqs({[type |-> "resolve_rolledback",
                           start_ts |-> start_ts,
                           primary |-> pk]})
             /\ UNCHANGED <<resp_msgs, client_vars, next_ts>>
@@ -427,9 +467,9 @@ ServerResolveCommitted ==
             /\ commit(k, start_ts, req.commit_ts)
             /\ UNCHANGED <<msg_vars, client_vars, key_data, next_ts>>
 
-ServerResolveRollbacked ==
+ServerResolveRolledback ==
   \E req \in req_msgs :
-    /\ req.type = "resolve_rollbacked"
+    /\ req.type = "resolve_rolledback"
     /\ LET
         start_ts == req.start_ts
        IN
@@ -444,12 +484,13 @@ ServerResolveRollbacked ==
 
 Init == 
   /\ next_ts = 1
+  /\ max_ts = 0
   /\ req_msgs = {}
   /\ resp_msgs = {}
   /\ client_state = [c \in CLIENT |-> "init"]
   /\ client_key = [c \in CLIENT |-> [locking |-> {}, prewriting |-> {}]]
   /\ client_ts = [c \in CLIENT |-> [start_ts |-> NoneTs,
-                                    commit_ts |-> NoneTs,
+                                    \* commit_ts |-> NoneTs,
                                     for_update_ts |-> NoneTs]]
   /\ key_lock = [k \in KEY |-> {}]
   /\ key_data = [k \in KEY |-> {}]
@@ -460,6 +501,7 @@ Next ==
         \/ ClientPrewriteOptimisistic(c)
         \/ ClientPrewritten(c)
         \/ ClientCommit(c)
+        \/ ClientCommitted(c)
   \/ \E c \in PESSIMISTIC_CLIENT :
         \/ ClientLockKey(c)
         \/ ClientLockedKey(c)
@@ -467,6 +509,7 @@ Next ==
         \/ ClientPrewritePessimistic(c)
         \/ ClientPrewritten(c)
         \/ ClientCommit(c)
+        \/ ClientCommitted(c)
   \/ ServerLockKey
   \/ ServerPrewritePessimistic
   \/ ServerPrewriteOptimistic
@@ -474,7 +517,7 @@ Next ==
   \/ ServerCleanupStaleLock
   \/ ServerCleanup
   \/ ServerResolveCommitted
-  \/ ServerResolveRollbacked
+  \/ ServerResolveRolledback
 
 Spec == Init /\ [][Next]_vars
 -----------------------------------------------------------------------------
@@ -562,19 +605,6 @@ MsgTsConsistency ==
           req.commit_ts <= next_ts
   /\ \A resp \in resp_msgs : resp.start_ts <= next_ts
 
-\* a client always read the same snapshot of other keys
-SnapshotRead == 
-  [][
-    \A c \in CLIENT:
-      \A key \in KEY \ CLIENT_KEY[c]:
-        LET
-          snapshot_ts == client_ts[c].start_ts
-          snapshot == {write \in key_write[key]: write.ts <= snapshot_ts /\ write.type = "write"}
-          new_snapshot == {write \in key_write'[key]: write.ts <= snapshot_ts /\ write.type = "write"}
-        IN
-          snapshot = new_snapshot
-    ]_vars
-    
 
 
 \* SnapshotIsolation is implied from the following assumptions (but is not
@@ -595,7 +625,6 @@ SnapshotIsolation == /\ CommitConsistency
                      /\ NextTsMonotonicity
                      /\ MsgMonotonicity
                      /\ MsgTsConsistency
-                     /\ SnapshotRead
 -----------------------------------------------------------------------------
 THEOREM Safety ==
   Spec => [](/\ TypeOK
