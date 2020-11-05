@@ -106,7 +106,7 @@ VARIABLES max_ts
 msg_vars == <<req_msgs, resp_msgs>>
 client_vars == <<client_state, client_ts, client_key>>
 key_vars == <<key_data, key_lock, key_write>>
-vars == <<msg_vars, client_vars, key_vars, next_ts>>
+vars == <<msg_vars, client_vars, key_vars, next_ts, max_ts>>
 
 SendReqs(msgs) == req_msgs' = req_msgs \union msgs
 SendResp(msg) == resp_msgs' = resp_msgs \union {msg}
@@ -116,8 +116,8 @@ SendResp(msg) == resp_msgs' = resp_msgs \union {msg}
 ReqMessages ==
           [start_ts : Ts, primary : KEY, type : {"lock_key"}, key : KEY,
             for_update_ts : Ts]
-  \union  [start_ts : Ts, primary : KEY, type : {"prewrite_optimistic"}, keys : SUBSET KEY]
-  \union  [start_ts : Ts, primary : KEY, type : {"prewrite_pessimistic"}, keys : SUBSET KEY]
+  \union  [start_ts : Ts, primary : KEY, type : {"prewrite_optimistic"}, key: KEY, secondaries : SUBSET KEY]
+  \union  [start_ts : Ts, primary : KEY, type : {"prewrite_pessimistic"}, key: KEY, secondaries : SUBSET KEY]
   \union  [start_ts : Ts, primary : KEY, type : {"commit"}, commit_ts : Ts]
   \union  [start_ts : Ts, primary : KEY, type : {"cleanup"}]
   \union  [start_ts : Ts, primary : KEY, type : {"resolve_rolledback"}]
@@ -134,19 +134,15 @@ RespMessages ==
 TypeOK == /\ req_msgs \in SUBSET ReqMessages
           /\ resp_msgs \in SUBSET RespMessages
           /\ key_data \in [KEY -> SUBSET Ts]
-          /\ key_lock \in [KEY -> SUBSET [ts : Ts, 
+          /\ key_lock \in [KEY -> ([ts : Ts, 
                                           primary : KEY, 
                                           type : {"prewrite_optimistic",
                                                   "prewrite_pessimistic",
                                                   "lock_key"},
                                           \* only used for lock of primary key. For secondary keys, can just be {}
                                           secondaries: SUBSET KEY 
-                                         ]
+                                  ] \union {{}}) \* there can be 0 or 1 lock associated with a certain key
                           ]
-          /\ \A k \in KEY :
-              \* At most one lock in key_lock[k]
-              \A l, l2 \in key_lock[k] :
-                l = l2
           /\ key_write \in [KEY -> SUBSET (
                       [ts : Ts, start_ts : Ts, type : {"write"}]
               \union  [ts : Ts, start_ts : Ts, type : {"rollback"}, protected : BOOLEAN])]
@@ -201,10 +197,13 @@ ClientPrewritePessimistic(c) ==
   /\ client_key[c].locking = {}
   /\ client_state' = [client_state EXCEPT ![c] = "prewriting"]
   /\ client_key' = [client_key EXCEPT ![c].prewriting = CLIENT_KEY[c]]
-  /\ SendReqs({[type |-> "prewrite_pessimistic",
+  /\ SendReqs({[
+                type |-> "prewrite_pessimistic",
                 start_ts |-> client_ts[c].start_ts,
                 primary |-> CLIENT_PRIMARY[c],
-                key |-> k] : k \in CLIENT_KEY[c]})
+                key |-> k,
+                secondaries |-> CLIENT_KEY[c] \ {CLIENT_PRIMARY[c]}
+               ] : k \in CLIENT_KEY[c]})
   /\ UNCHANGED <<resp_msgs, key_vars, client_ts, next_ts>>
 
 ClientPrewriteOptimisistic(c) ==
@@ -213,11 +212,13 @@ ClientPrewriteOptimisistic(c) ==
   /\ client_ts' = [client_ts EXCEPT ![c].start_ts = next_ts]
   /\ next_ts' = next_ts + 1
   /\ client_key' = [client_key EXCEPT ![c].prewriting = CLIENT_KEY[c]]
-  /\ SendReqs({[type |-> "prewrite_optimistic",
+  /\ SendReqs({[
+                type |-> "prewrite_optimistic",
                 start_ts |-> client_ts'[c].start_ts,
                 primary |-> CLIENT_PRIMARY[c],
-                keys |-> {k: k \in CLIENT_KEY[c]}
-                ]})
+                key |-> k,
+                secondaries |-> CLIENT_KEY[c] \ {CLIENT_PRIMARY[c]}
+               ] : k \in CLIENT_KEY[c]})
   /\ UNCHANGED <<resp_msgs, key_vars, max_ts>>
 
 ClientPrewritten(c) ==
@@ -282,7 +283,9 @@ rollback(k, start_ts) ==
                  \/ key_lock[k] = {}
   IN
     \* If a lock exists and has the same ts, unlock it.
-    /\ IF \E l \in key_lock[k] : l.ts = start_ts
+    /\ IF 
+         /\ key_lock[k] /= {} 
+         /\ key_lock[k].ts = start_ts
        THEN key_lock' = [key_lock EXCEPT ![k] = {}]
        ELSE UNCHANGED key_lock
     /\ key_data' = [key_data EXCEPT ![k] = @ \ {start_ts}]
@@ -331,9 +334,10 @@ ServerLockKey ==
                 \* a new version is committed after for_update_ts, which
                 \* violates Read Committed guarantee.
                 \/ /\ ~ \E w \in latest_commit : w.ts > req.for_update_ts
-                   /\ key_lock' = [key_lock EXCEPT ![k] = {[ts |-> start_ts,
+                   /\ key_lock' = [key_lock EXCEPT ![k] = [ts |-> start_ts,
                                                             primary |-> req.primary,
-                                                            type |-> "lock_key"]}]
+                                                            type |-> "lock_key",
+                                                            secondaries |-> {}]]
                    /\ update_max_ts(req.for_update_ts)
                    /\ SendResp([start_ts |-> start_ts, type |-> "locked_key", key |-> k])
                    /\ UNCHANGED <<req_msgs, client_vars, key_data, key_write, next_ts>>
@@ -356,7 +360,8 @@ ServerPrewritePessimistic ==
        IN
         \* Pessimistic prewrite is allowed only if pressimistic lock is
         \* acquired, otherwise abort the transaction.
-        /\ IF \E l \in key_lock[k] : l.ts = start_ts
+        /\ IF /\ key_lock[k] /= {} 
+              /\ key_lock[k].ts = start_ts
            THEN
               /\ key_lock' = [key_lock EXCEPT ![k] = {[ts |-> start_ts,
                                                       primary |-> req.primary,
@@ -386,8 +391,10 @@ ServerPrewriteOptimistic ==
                  \/ \E l \in key_lock[k] : l.ts = start_ts
               /\ key_lock' = [key_lock EXCEPT ![k] = {[ts |-> start_ts,
                                                        primary |-> req.primary,
-                                                       type |-> "prewrite_optimistic"]}]
+                                                       type |-> "prewrite_optimistic",
+                                                       secondaries |-> req.secondaries]}]
               /\ key_data' = [key_data EXCEPT ![k] = @ \union {start_ts}]
+              /\ update_max_ts(start_ts)
               /\ SendResp([start_ts |-> start_ts, type |-> "prewritten", key |-> k])
               /\ UNCHANGED <<req_msgs, client_vars, key_write, next_ts>>
 
